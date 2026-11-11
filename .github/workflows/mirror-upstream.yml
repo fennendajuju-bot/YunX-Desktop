@@ -43,7 +43,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh api --paginate "repos/$SOURCE/releases?per_page=100" --jq '.[] | select(.draft == false) | @base64' | while IFS= read -r row; do
+          gh api "repos/$SOURCE/releases/latest" --jq '@base64' | while IFS= read -r row; do
             release=$(printf '%s' "$row" | base64 --decode)
             tag=$(jq -r '.tag_name' <<< "$release")
             encoded=$(jq -rn --arg t "$tag" '$t|@uri')
