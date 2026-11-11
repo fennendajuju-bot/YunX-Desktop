@@ -1,0 +1,71 @@
+name: Mirror upstream
+on:
+  schedule:
+    - cron: '37 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: upstream-backup
+  cancel-in-progress: false
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET: ${{ github.repository }}
+      SOURCE: tidain/YunX-Desktop
+    steps:
+      - name: Sync source branches and tags without deleting backups
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$SOURCE/branches?per_page=100" --jq '.[].name' | while IFS= read -r branch; do
+            encoded=$(jq -rn --arg b "$branch" '$b|@uri')
+            sha=$(gh api "repos/$SOURCE/git/ref/heads/$encoded" --jq '.object.sha')
+            if gh api "repos/$TARGET/git/ref/heads/$encoded" >/dev/null 2>&1; then
+              gh api --method POST "repos/$TARGET/merge-upstream" -f branch="$branch"
+            else
+              gh api --method POST "repos/$TARGET/git/refs" -f ref="refs/heads/$branch" -f sha="$sha"
+            fi
+          done
+          gh api --paginate "repos/$SOURCE/git/matching-refs/tags/" --jq '.[] | [.ref,.object.sha] | @tsv' | while IFS=$'	' read -r ref sha; do
+            encoded=$(jq -rn --arg r "${ref#refs/}" '$r|@uri')
+            if gh api "repos/$TARGET/git/ref/$encoded" >/dev/null 2>&1; then
+              actual=$(gh api "repos/$TARGET/git/ref/$encoded" --jq '.object.sha')
+              test "$actual" = "$sha" || { echo "Tag changed upstream: $ref; preserving backup"; exit 1; }
+            else
+              gh api --method POST "repos/$TARGET/git/refs" -f ref="$ref" -f sha="$sha"
+            fi
+          done
+      - name: Back up releases and verify uploaded asset digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$SOURCE/releases?per_page=100" --jq '.[] | select(.draft == false) | @base64' | while IFS= read -r row; do
+            release=$(printf '%s' "$row" | base64 --decode)
+            tag=$(jq -r '.tag_name' <<< "$release")
+            encoded=$(jq -rn --arg t "$tag" '$t|@uri')
+            if ! gh api "repos/$TARGET/releases/tags/$encoded" >/dev/null 2>&1; then
+              jq '{tag_name,name,body,prerelease,make_latest:"false"}' <<< "$release" | gh api --method POST "repos/$TARGET/releases" --input -
+            fi
+            dest=$(gh api "repos/$TARGET/releases/tags/$encoded")
+            dir=$(mktemp -d)
+            jq -r '.assets[] | @base64' <<< "$release" | while IFS= read -r assetrow; do
+              asset=$(printf '%s' "$assetrow" | base64 --decode)
+              name=$(jq -r '.name' <<< "$asset")
+              digest=$(jq -r '.digest // empty' <<< "$asset")
+              if jq -e --arg n "$name" --arg d "$digest" '.assets[] | select(.name == $n and .digest == $d and $d != "")' <<< "$dest" >/dev/null; then continue; fi
+              gh release download "$tag" --repo "$SOURCE" --pattern "$name" --dir "$dir"
+              if [ -n "$digest" ]; then echo "${digest#sha256:}  $dir/$name" | sha256sum --check; fi
+              if jq -e --arg n "$name" '.assets[] | select(.name == $n)' <<< "$dest" >/dev/null; then
+                echo "Existing asset differs: $tag/$name; preserving old backup"; exit 1
+              fi
+              gh release upload "$tag" "$dir/$name" --repo "$TARGET"
+              actual=$(gh api "repos/$TARGET/releases/tags/$encoded" --jq ".assets[] | select(.name == \"$name\") | .digest")
+              if [ -n "$digest" ]; then test "$actual" = "$digest"; fi
+              rm "$dir/$name"
+            done
+            rmdir "$dir"
+          done
